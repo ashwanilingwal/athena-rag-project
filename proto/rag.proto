@@ -1,0 +1,137 @@
+// The contract between athena-api (Java) and athena-rag (Python).
+//
+// Rule of the seam: Java owns state and correctness. Python owns inference and
+// relevance. Every field here exists because one side needs something the other
+// side is authoritative about. If you find yourself adding a field so that Python
+// can make a policy decision, stop — that decision belongs in Java.
+syntax = "proto3";
+package athena.rag.v1;
+
+option java_multiple_files = true;
+option java_package = "com.athena.rag.grpc.v1";
+option java_outer_classname = "RagProto";
+
+service RagService {
+  // Index a document Java has already stored and assigned an id to.
+  // MUST be idempotent on document_id: calling twice leaves one copy.
+  rpc IndexDocument(IndexDocumentRequest) returns (IndexDocumentResponse);
+
+  // Retrieval only, no generation. Used by /v1/search and by the eval harness.
+  rpc Retrieve(RetrieveRequest) returns (RetrieveResponse);
+
+  // Full RAG answer. Server-streaming: sources frame first, then tokens,
+  // then a completion frame carrying usage and per-stage timings.
+  rpc Answer(AnswerRequest) returns (stream AnswerChunk);
+
+  rpc DeleteDocument(DeleteDocumentRequest) returns (DeleteDocumentResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+// ---------------------------------------------------------------- indexing
+
+message IndexDocumentRequest {
+  string tenant_id    = 1;
+  string document_id  = 2;  // Java's UUID. The idempotency key for this RPC.
+  string uri          = 3;  // filesystem path or object-store key
+  string content_type = 4;  // text/plain, text/markdown
+  IndexOptions options = 5;
+  string trace_id     = 6;  // propagated from the Java request, logged on both sides
+}
+
+message IndexOptions {
+  int32  chunk_tokens    = 1;  // 0 -> server default (512)
+  int32  chunk_overlap   = 2;  // 0 -> server default (64)
+  string embedding_model = 3;  // "" -> server default
+}
+
+message IndexDocumentResponse {
+  int32 chunks_indexed = 1;
+  int64 took_ms        = 2;
+  bool  replaced_existing = 3;  // true when a prior version was deleted first
+}
+
+// ---------------------------------------------------------------- retrieval
+
+enum RetrievalStrategy {
+  STRATEGY_UNSPECIFIED = 0;  // treated as HYBRID_RRF
+  DENSE                = 1;
+  LEXICAL              = 2;
+  HYBRID_RRF           = 3;
+  HYBRID_RRF_RERANK    = 4;
+}
+
+message RetrieveRequest {
+  string tenant_id = 1;
+  string query     = 2;
+  int32  top_k     = 3;  // 0 -> 5
+  RetrievalStrategy strategy = 4;
+  repeated string document_ids = 5;  // optional scope filter
+  string trace_id  = 6;
+}
+
+message Passage {
+  string chunk_id    = 1;
+  string document_id = 2;
+  string text        = 3;
+  float  score       = 4;
+  int32  rank        = 5;  // 1-based, post-fusion
+  map<string, string> metadata = 6;  // heading, ordinal, source
+}
+
+// Per-stage latency. This is what the Grafana panel and the README table need.
+message Timings {
+  int64 embed_ms    = 1;
+  int64 vector_ms   = 2;
+  int64 lexical_ms  = 3;
+  int64 rerank_ms   = 4;
+  int64 generate_ms = 5;
+}
+
+message RetrieveResponse {
+  repeated Passage passages = 1;
+  int64   took_ms = 2;
+  Timings timings = 3;
+}
+
+// ---------------------------------------------------------------- answering
+
+message Turn { string role = 1; string content = 2; }
+
+message AnswerRequest {
+  string tenant_id = 1;
+  string query     = 2;
+  int32  top_k     = 3;
+  RetrievalStrategy strategy = 4;
+  repeated Turn history = 5;
+  string trace_id  = 6;
+}
+
+message AnswerComplete {
+  int32   prompt_chars     = 1;
+  int32   completion_chars = 2;
+  Timings timings          = 3;
+  bool    grounded         = 4;  // false when the model refused for lack of context
+}
+
+// Ordering is a product decision: sources arrive before the first token so the
+// client can render citations while generation is still running.
+message AnswerChunk {
+  oneof payload {
+    RetrieveResponse retrieval = 1;
+    string           token     = 2;
+    AnswerComplete   complete  = 3;
+  }
+}
+
+// ---------------------------------------------------------------- lifecycle
+
+message DeleteDocumentRequest  { string tenant_id = 1; string document_id = 2; }
+message DeleteDocumentResponse { int32 chunks_deleted = 1; }
+
+message HealthRequest  {}
+message HealthResponse {
+  bool   ready           = 1;
+  string embedding_model = 2;
+  int32  dimensions      = 3;
+  int64  indexed_chunks  = 4;
+}

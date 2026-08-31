@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+gen/rag_pb2.py
+gen/rag_pb2.pyi
+gen/rag_pb2_grpc.py
